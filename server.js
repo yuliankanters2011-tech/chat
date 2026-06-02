@@ -13,7 +13,7 @@ const http = require("http").Server(app);
 
 const maxHttpBufferSizeInMb = parseInt(process.env.MAX_HTTP_BUFFER_SIZE_MB || '1');
 const io = require("socket.io")(http, {
-  maxHttpBufferSize: maxHttpBufferSizeInMb * 1024 * 1024,
+	maxHttpBufferSize: maxHttpBufferSizeInMb * 1024 * 1024,
 });
 
 let messageCache = [];
@@ -40,7 +40,17 @@ function loadBadWords() {
 }
 
 function filterMessage(text) {
-	if (!text) return text;
+	if (text === null || text === undefined) {
+		return '';
+	}
+
+	if (typeof text !== 'string') {
+		try {
+			text = JSON.stringify(text);
+		} catch (e) {
+			text = String(text);
+		}
+	}
 
 	let out = text;
 
@@ -100,7 +110,7 @@ io.sockets.on("connection", function(socket){
 			"users": users
 		});
 
-		console.log(`going to send cache to ${nick}`)
+		console.log(`going to send cache to ${nick}`);
 
 		socket.emit("previous-msg", {
 			"msgs": messageCache
@@ -114,9 +124,28 @@ io.sockets.on("connection", function(socket){
 			return;
 		}
 
+		let messageText = '';
+
+		if (typeof data === 'string') {
+			messageText = data;
+		}
+		else if (typeof data?.m === 'string') {
+			messageText = data.m;
+		}
+		else if (typeof data?.message === 'string') {
+			messageText = data.message;
+		}
+		else {
+			try {
+				messageText = JSON.stringify(data);
+			} catch (e) {
+				messageText = String(data);
+			}
+		}
+
 		const msg = {
 			"f": nick,
-			"m": filterMessage(data.m),
+			"m": filterMessage(messageText),
 			"id": "msg_" + (msg_id++)
 		}
 
