@@ -143,12 +143,13 @@ io.sockets.on("connection", function(socket){
 			}
 		}
 
-		const msg = {
-			"f": nick,
-			"m": filterMessage(messageText),
-			"id": "msg_" + (msg_id++)
-		}
+		console.log("RAW DATA:", JSON.stringify(data, null, 2));
 
+const msg = {
+	"f": nick,
+	"m": data.m,
+	"id": "msg_" + (msg_id++)
+}
 		messageCache.push(msg);
 
 		if(messageCache.length > cache_size){
