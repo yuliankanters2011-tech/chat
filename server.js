@@ -20,7 +20,7 @@ let messageCache = [];
 let cache_size = process.env.CACHE_SIZE ?? 0;
 
 // ====================
-// BLOCKED WORDS SYSTEM
+// BLOCKED WORDS
 // ====================
 
 let badWords = [];
@@ -60,6 +60,33 @@ function filterMessage(text) {
 	return out;
 }
 
+function containsBlockedNickname(text) {
+
+	if (!text) return false;
+
+	const normalizedNick = text
+		.toLowerCase()
+		.normalize("NFKD")
+		.replace(/[^a-z0-9]/g, '');
+
+	for (const word of badWords) {
+
+		const normalizedWord = word
+			.toLowerCase()
+			.normalize("NFKD")
+			.replace(/[^a-z0-9]/g, '');
+
+		if (
+			normalizedWord &&
+			normalizedNick.includes(normalizedWord)
+		) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 loadBadWords();
 setInterval(loadBadWords, 30000);
 
@@ -83,6 +110,15 @@ io.sockets.on("connection", function(socket){
 
 		if(data.nick == ""){
 			socket.emit("force-login", "Nick can't be empty.");
+			nick = null;
+			return;
+		}
+
+		if(containsBlockedNickname(data.nick)){
+			socket.emit(
+				"force-login",
+				"Deze gebruikersnaam bevat een geblokkeerd woord."
+			);
 			nick = null;
 			return;
 		}
