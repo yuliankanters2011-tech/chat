@@ -48,11 +48,25 @@ function filterMessage(text) {
 	let out = text;
 
 	badWords.forEach(word => {
+
+		if (!word) return;
+
+		// Exact woord
 		const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-		const regex = new RegExp(escaped, 'gi');
 
 		out = out.replace(
-			regex,
+			new RegExp(escaped, 'gi'),
+			'*'.repeat(word.length)
+		);
+
+		// k u t / k.u.t / k-u-t / k_u_t
+		const pattern = word
+			.split('')
+			.map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+			.join('[\\s._-]*');
+
+		out = out.replace(
+			new RegExp(pattern, 'gi'),
 			'*'.repeat(word.length)
 		);
 	});
