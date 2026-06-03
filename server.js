@@ -17,7 +17,7 @@ const io = require("socket.io")(http, {
 });
 
 let messageCache = [];
-let cache_size = process.env.CACHE_SIZE ?? 0
+let cache_size = process.env.CACHE_SIZE ?? 0;
 
 // ====================
 // BLOCKED WORDS SYSTEM
@@ -40,16 +40,9 @@ function loadBadWords() {
 }
 
 function filterMessage(text) {
-	if (text === null || text === undefined) {
-		return '';
-	}
 
 	if (typeof text !== 'string') {
-		try {
-			text = JSON.stringify(text);
-		} catch (e) {
-			text = String(text);
-		}
+		return text;
 	}
 
 	let out = text;
@@ -57,7 +50,11 @@ function filterMessage(text) {
 	badWords.forEach(word => {
 		const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 		const regex = new RegExp(escaped, 'gi');
-		out = out.replace(regex, '*'.repeat(word.length));
+
+		out = out.replace(
+			regex,
+			'*'.repeat(word.length)
+		);
 	});
 
 	return out;
@@ -110,7 +107,7 @@ io.sockets.on("connection", function(socket){
 			"users": users
 		});
 
-		console.log(`going to send cache to ${nick}`);
+		console.log(`going to send cache to ${nick}`)
 
 		socket.emit("previous-msg", {
 			"msgs": messageCache
@@ -124,32 +121,25 @@ io.sockets.on("connection", function(socket){
 			return;
 		}
 
-		let messageText = '';
+		let messageObject = data.m;
 
-		if (typeof data === 'string') {
-			messageText = data;
-		}
-		else if (typeof data?.m === 'string') {
-			messageText = data.m;
-		}
-		else if (typeof data?.message === 'string') {
-			messageText = data.message;
-		}
-		else {
-			try {
-				messageText = JSON.stringify(data);
-			} catch (e) {
-				messageText = String(data);
-			}
+		if (
+			messageObject &&
+			typeof messageObject === "object" &&
+			typeof messageObject.text === "string"
+		) {
+			messageObject = {
+				...messageObject,
+				text: filterMessage(messageObject.text)
+			};
 		}
 
-		console.log("RAW DATA:", JSON.stringify(data, null, 2));
+		const msg = {
+			"f": nick,
+			"m": messageObject,
+			"id": "msg_" + (msg_id++)
+		}
 
-const msg = {
-	"f": nick,
-	"m": data.m,
-	"id": "msg_" + (msg_id++)
-}
 		messageCache.push(msg);
 
 		if(messageCache.length > cache_size){
@@ -174,7 +164,6 @@ const msg = {
 	});
 
 	socket.on("disconnect", function(){
-
 		console.log("Got disconnect!");
 
 		if(nick != null){
