@@ -161,15 +161,14 @@ setInterval(loadBadWords, 30000);
 // Bevat: ip bans, device fingerprint bans, nick bans
 // ====================
 
-let bans = { ips: [], devices: [], nicks: [] };
+let bans = { devices: [], nicks: [] };
 
 function loadBans() {
 	try {
 		bans = JSON.parse(fs.readFileSync('/data/bans.json', 'utf8'));
-		bans.ips = bans.ips || [];
 		bans.devices = bans.devices || [];
 		bans.nicks = bans.nicks || [];
-		console.log(`Loaded bans: ${bans.ips.length} IPs, ${bans.devices.length} devices, ${bans.nicks.length} nicks`);
+		console.log(`Loaded bans: ${bans.devices.length} devices, ${bans.nicks.length} nicks`);
 	} catch (err) {
 		bans = { ips: [], devices: [], nicks: [] };
 	}
@@ -183,10 +182,6 @@ function saveBans() {
 	}
 }
 
-function isIpBanned(ip) {
-	return bans.ips.includes(ip);
-}
-
 function isDeviceBanned(fingerprint) {
 	if (!fingerprint) return false;
 	return bans.devices.includes(fingerprint);
@@ -196,22 +191,21 @@ function isNickBanned(nick) {
 	return bans.nicks.map(n => n.toLowerCase()).includes(nick.toLowerCase());
 }
 
-function banUser(nick, ip, fingerprint) {
-	if (ip && !bans.ips.includes(ip)) bans.ips.push(ip);
+function banUser(nick, fingerprint) {
+	// Alleen device fingerprint + nick bannen, NOOIT het IP
+	// Zo worden andere apparaten op hetzelfde wifi niet geblokkeerd
 	if (fingerprint && !bans.devices.includes(fingerprint)) bans.devices.push(fingerprint);
 	if (nick && !bans.nicks.map(n=>n.toLowerCase()).includes(nick.toLowerCase())) bans.nicks.push(nick);
 	saveBans();
-	console.log(`Banned: nick=${nick}, ip=${ip}, device=${fingerprint}`);
+	console.log(`Banned: nick=${nick}, device=${fingerprint}`);
 }
 
 function unbanUser(nick) {
-	// Verwijder uit alle lijsten
 	bans.nicks = bans.nicks.filter(n => n.toLowerCase() !== nick.toLowerCase());
-	// Zoek bijbehorende IP/device op in actieve sessies
+	// Zoek bijbehorende device op in actieve sessies
 	const session = Object.values(activeSessions).find(s => s.nick && s.nick.toLowerCase() === nick.toLowerCase());
-	if (session) {
-		if (session.ip) bans.ips = bans.ips.filter(i => i !== session.ip);
-		if (session.fingerprint) bans.devices = bans.devices.filter(d => d !== session.fingerprint);
+	if (session && session.fingerprint) {
+		bans.devices = bans.devices.filter(d => d !== session.fingerprint);
 	}
 	saveBans();
 	console.log(`Unbanned: nick=${nick}`);
@@ -226,10 +220,6 @@ loadBans();
 // Actieve sessies: socketId -> { nick, ip, fingerprint }
 const activeSessions = {};
 
-function getActiveIp(ip) {
-	return Object.values(activeSessions).find(s => s.ip === ip);
-}
-
 function getActiveDevice(fingerprint) {
 	if (!fingerprint) return null;
 	return Object.values(activeSessions).find(s => s.fingerprint === fingerprint);
@@ -241,13 +231,13 @@ function getActiveDevice(fingerprint) {
 
 const swearStrikes = {}; // nick -> count
 
-function addSwearStrike(nick, ip, fingerprint) {
+function addSwearStrike(nick, fingerprint) {
 	if (!swearStrikes[nick]) swearStrikes[nick] = 0;
 	swearStrikes[nick]++;
 	console.log(`Swear strike ${swearStrikes[nick]}/3 voor ${nick}`);
 
 	if (swearStrikes[nick] >= 3) {
-		banUser(nick, ip, fingerprint);
+		banUser(nick, fingerprint);
 		// Kick de gebruiker
 		const socketId = Object.keys(activeSessions).find(id => activeSessions[id].nick === nick);
 		if (socketId) {
@@ -295,13 +285,6 @@ io.sockets.on("connection", function(socket){
 			deviceFingerprint = data.fingerprint;
 		}
 
-		// Check IP ban
-		if (isIpBanned(socketIp)) {
-			socket.emit("force-login", "Je bent verbannen van deze chat.");
-			socket.disconnect(true);
-			return;
-		}
-
 		// Check device ban
 		if (deviceFingerprint && isDeviceBanned(deviceFingerprint)) {
 			socket.emit("force-login", "Je bent verbannen van deze chat.");
@@ -329,19 +312,11 @@ io.sockets.on("connection", function(socket){
 			return;
 		}
 
-		// 1 account per IP: check of dit IP al actief is
-		const existingIpSession = getActiveIp(socketIp);
-		if (existingIpSession) {
-			socket.emit("force-login", "Er is al iemand ingelogd vanaf jouw netwerk.");
-			socket.disconnect(true);
-			return;
-		}
-
-		// 1 account per device fingerprint
+		// 1 account per apparaat (fingerprint) — meerdere apparaten op zelfde wifi werken gewoon
 		if (deviceFingerprint) {
 			const existingDeviceSession = getActiveDevice(deviceFingerprint);
 			if (existingDeviceSession) {
-				socket.emit("force-login", "Er is al iemand ingelogd vanaf dit apparaat.");
+				socket.emit("force-login", "Je bent al ingelogd op dit apparaat.");
 				socket.disconnect(true);
 				return;
 			}
@@ -401,7 +376,6 @@ io.sockets.on("connection", function(socket){
 					const targetSession = Object.values(activeSessions).find(s => s.nick && s.nick.toLowerCase() === targetNick.toLowerCase());
 					banUser(
 						targetNick,
-						targetSession ? targetSession.ip : null,
 						targetSession ? targetSession.fingerprint : null
 					);
 					// Kick de gebande gebruiker
@@ -446,7 +420,7 @@ io.sockets.on("connection", function(socket){
 			// Als er een scheldwoord in zat, strike geven
 			if (hasBadWord) {
 				const session = activeSessions[socket.id];
-				const banned = addSwearStrike(nick, session ? session.ip : null, session ? session.fingerprint : null);
+				const banned = addSwearStrike(nick, session ? session.fingerprint : null);
 				if (banned) return; // Gebruiker is nu verbannen, bericht niet sturen
 			}
 		}
