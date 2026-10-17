@@ -4,9 +4,62 @@ const app = express()
 
 const path = require('path')
 const fs = require('fs')
+const crypto = require('crypto')
 
 const html = path.join(__dirname, '/html');
-app.use(express.static(html))
+
+// Injecteer fingerprint script in index.html zonder de originele bestanden te wijzigen
+const fingerprintScript = `
+<script>
+(function() {
+  function generateFingerprint() {
+    var components = [
+      navigator.userAgent,
+      navigator.language,
+      screen.width + 'x' + screen.height,
+      screen.colorDepth,
+      new Date().getTimezoneOffset(),
+      navigator.hardwareConcurrency || '',
+      navigator.platform || ''
+    ];
+    var raw = components.join('|');
+    var hash = 0;
+    for (var i = 0; i < raw.length; i++) {
+      hash = ((hash << 5) - hash) + raw.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+  window.__deviceFingerprint = generateFingerprint();
+
+  // Patch de socket.emit zodat fingerprint automatisch meegestuurd wordt bij login
+  document.addEventListener('DOMContentLoaded', function() {
+    var origEmit = null;
+    var checkSocket = setInterval(function() {
+      if (window.socket) {
+        clearInterval(checkSocket);
+        origEmit = window.socket.emit.bind(window.socket);
+        window.socket.emit = function(event, data) {
+          if (event === 'login' && data) {
+            data.fingerprint = window.__deviceFingerprint;
+          }
+          return origEmit(event, data);
+        };
+      }
+    }, 100);
+  });
+})();
+</script>`;
+
+app.get('/', function(req, res) {
+  const indexPath = path.join(html, 'index.html');
+  let content = fs.readFileSync(indexPath, 'utf8');
+  // Injecteer vóór </head>
+  content = content.replace('</head>', fingerprintScript + '</head>');
+  res.send(content);
+});
+
+app.use(express.static(html));
 
 const port = process.argv[2] || 8090;
 const http = require("http").Server(app);
@@ -20,6 +73,31 @@ let messageCache = [];
 let cache_size = process.env.CACHE_SIZE ?? 0;
 
 // ====================
+// ADMIN WACHTWOORD
+// Lees uit /data/admin-password.txt — zelfde systeem als blocked-words.txt
+// Staat NOOIT in de HTML of client-side JS
+// ====================
+
+let ADMIN_PASSWORD = 'changeme123';
+
+function loadAdminPassword() {
+	try {
+		const pw = fs.readFileSync('/data/admin-password.txt', 'utf8').trim();
+		if (pw.length > 0) {
+			ADMIN_PASSWORD = pw;
+			console.log('Admin wachtwoord geladen.');
+		} else {
+			console.warn('admin-password.txt is leeg, standaardwachtwoord actief!');
+		}
+	} catch (err) {
+		console.warn('admin-password.txt niet gevonden, standaardwachtwoord actief:', err.message);
+	}
+}
+
+loadAdminPassword();
+setInterval(loadAdminPassword, 30000);
+
+// ====================
 // BLOCKED WORDS
 // ====================
 
@@ -31,7 +109,6 @@ function loadBadWords() {
 			.split('\n')
 			.map(w => w.trim())
 			.filter(Boolean);
-
 		console.log(`Loaded ${badWords.length} blocked words.`);
 	} catch (err) {
 		console.error('Failed to load blocked words:', err.message);
@@ -40,69 +117,160 @@ function loadBadWords() {
 }
 
 function filterMessage(text) {
-
-	if (typeof text !== 'string') {
-		return text;
-	}
-
+	if (typeof text !== 'string') return text;
 	let out = text;
-
 	badWords.forEach(word => {
-
 		if (!word) return;
-
-		// Exact woord
 		const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-		out = out.replace(
-			new RegExp(escaped, 'gi'),
-			'*'.repeat(word.length)
-		);
-
-		// k u t / k.u.t / k-u-t / k_u_t
+		out = out.replace(new RegExp(escaped, 'gi'), '*'.repeat(word.length));
 		const pattern = word
 			.split('')
 			.map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 			.join('[\\s._-]*');
-
-		out = out.replace(
-			new RegExp(pattern, 'gi'),
-			'*'.repeat(word.length)
-		);
+		out = out.replace(new RegExp(pattern, 'gi'), '*'.repeat(word.length));
 	});
-
 	return out;
 }
 
 function containsBlockedNickname(text) {
-
 	if (!text) return false;
-
-	const normalizedNick = text
-		.toLowerCase()
-		.normalize("NFKD")
-		.replace(/[^a-z0-9]/g, '');
-
+	const normalizedNick = text.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]/g, '');
 	for (const word of badWords) {
-
-		const normalizedWord = word
-			.toLowerCase()
-			.normalize("NFKD")
-			.replace(/[^a-z0-9]/g, '');
-
-		if (
-			normalizedWord &&
-			normalizedNick.includes(normalizedWord)
-		) {
-			return true;
-		}
+		const normalizedWord = word.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]/g, '');
+		if (normalizedWord && normalizedNick.includes(normalizedWord)) return true;
 	}
+	return false;
+}
 
+function containsBadWord(text) {
+	if (!text) return false;
+	const normalized = text.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]/g, '');
+	for (const word of badWords) {
+		const normalizedWord = word.toLowerCase().normalize("NFKD").replace(/[^a-z0-9]/g, '');
+		if (normalizedWord && normalized.includes(normalizedWord)) return true;
+	}
 	return false;
 }
 
 loadBadWords();
 setInterval(loadBadWords, 30000);
+
+// ====================
+// BAN SYSTEEM
+// Opgeslagen in /data/bans.json
+// Bevat: ip bans, device fingerprint bans, nick bans
+// ====================
+
+let bans = { ips: [], devices: [], nicks: [] };
+
+function loadBans() {
+	try {
+		bans = JSON.parse(fs.readFileSync('/data/bans.json', 'utf8'));
+		bans.ips = bans.ips || [];
+		bans.devices = bans.devices || [];
+		bans.nicks = bans.nicks || [];
+		console.log(`Loaded bans: ${bans.ips.length} IPs, ${bans.devices.length} devices, ${bans.nicks.length} nicks`);
+	} catch (err) {
+		bans = { ips: [], devices: [], nicks: [] };
+	}
+}
+
+function saveBans() {
+	try {
+		fs.writeFileSync('/data/bans.json', JSON.stringify(bans, null, 2));
+	} catch (err) {
+		console.error('Failed to save bans:', err.message);
+	}
+}
+
+function isIpBanned(ip) {
+	return bans.ips.includes(ip);
+}
+
+function isDeviceBanned(fingerprint) {
+	if (!fingerprint) return false;
+	return bans.devices.includes(fingerprint);
+}
+
+function isNickBanned(nick) {
+	return bans.nicks.map(n => n.toLowerCase()).includes(nick.toLowerCase());
+}
+
+function banUser(nick, ip, fingerprint) {
+	if (ip && !bans.ips.includes(ip)) bans.ips.push(ip);
+	if (fingerprint && !bans.devices.includes(fingerprint)) bans.devices.push(fingerprint);
+	if (nick && !bans.nicks.map(n=>n.toLowerCase()).includes(nick.toLowerCase())) bans.nicks.push(nick);
+	saveBans();
+	console.log(`Banned: nick=${nick}, ip=${ip}, device=${fingerprint}`);
+}
+
+function unbanUser(nick) {
+	// Verwijder uit alle lijsten
+	bans.nicks = bans.nicks.filter(n => n.toLowerCase() !== nick.toLowerCase());
+	// Zoek bijbehorende IP/device op in actieve sessies
+	const session = Object.values(activeSessions).find(s => s.nick && s.nick.toLowerCase() === nick.toLowerCase());
+	if (session) {
+		if (session.ip) bans.ips = bans.ips.filter(i => i !== session.ip);
+		if (session.fingerprint) bans.devices = bans.devices.filter(d => d !== session.fingerprint);
+	}
+	saveBans();
+	console.log(`Unbanned: nick=${nick}`);
+}
+
+loadBans();
+
+// ====================
+// 1 ACCOUNT PER IP + DEVICE TRACKING
+// ====================
+
+// Actieve sessies: socketId -> { nick, ip, fingerprint }
+const activeSessions = {};
+
+function getActiveIp(ip) {
+	return Object.values(activeSessions).find(s => s.ip === ip);
+}
+
+function getActiveDevice(fingerprint) {
+	if (!fingerprint) return null;
+	return Object.values(activeSessions).find(s => s.fingerprint === fingerprint);
+}
+
+// ====================
+// SCHELD TRACKING (3 pogingen dan ban)
+// ====================
+
+const swearStrikes = {}; // nick -> count
+
+function addSwearStrike(nick, ip, fingerprint) {
+	if (!swearStrikes[nick]) swearStrikes[nick] = 0;
+	swearStrikes[nick]++;
+	console.log(`Swear strike ${swearStrikes[nick]}/3 voor ${nick}`);
+
+	if (swearStrikes[nick] >= 3) {
+		banUser(nick, ip, fingerprint);
+		// Kick de gebruiker
+		const socketId = Object.keys(activeSessions).find(id => activeSessions[id].nick === nick);
+		if (socketId) {
+			const targetSocket = io.sockets.sockets.get(socketId);
+			if (targetSocket) {
+				targetSocket.emit("force-login", "Je bent permanent verbannen wegens herhaaldelijk schelden.");
+				targetSocket.disconnect(true);
+			}
+		}
+		return true; // gebanned
+	}
+
+	// Waarschuw de gebruiker
+	const socketId = Object.keys(activeSessions).find(id => activeSessions[id].nick === nick);
+	if (socketId) {
+		const targetSocket = io.sockets.sockets.get(socketId);
+		if (targetSocket) {
+			const remaining = 3 - swearStrikes[nick];
+			targetSocket.emit("warn", `Waarschuwing: schelden is niet toegestaan. Nog ${remaining} kans(en) voor je verbannen wordt.`);
+		}
+	}
+	return false;
+}
 
 // ====================
 
@@ -113,130 +281,174 @@ http.listen(port, function(){
 const users = [];
 let msg_id = 1;
 
-// ====================
-// RATE LIMITING
-// ====================
-
-const ipConnects = {};
-const IP_LIMIT = 5;
-const IP_WINDOW = 30000;
-
-io.use((socket, next) => {
-	const ip = socket.handshake.address;
-	const now = Date.now();
-
-	if (!ipConnects[ip]) {
-		ipConnects[ip] = { count: 1, firstTime: now };
-		return next();
-	}
-
-	const elapsed = now - ipConnects[ip].firstTime;
-	if (elapsed > IP_WINDOW) {
-		ipConnects[ip] = { count: 1, firstTime: now };
-		return next();
-	}
-
-	ipConnects[ip].count++;
-	if (ipConnects[ip].count > IP_LIMIT) {
-		console.log(`Rate limit hit for IP: ${ip}`);
-		return next(new Error('Te veel verbindingen, probeer het later opnieuw.'));
-	}
-
-	next();
-});
-
-// ====================
-
 io.sockets.on("connection", function(socket){
 	console.log("New connection!");
 
 	var nick = null;
-
-	// Login rate limiting per socket
-	let loginAttempts = 0;
-	const LOGIN_LIMIT = 5;
-	let loginBlocked = false;
+	const socketIp = socket.handshake.address;
+	var deviceFingerprint = null;
 
 	socket.on("login", function(data){
 
-		if (loginBlocked) {
-			socket.emit("force-login", "Te veel inlogpogingen. Vernieuw de pagina.");
+		// Fingerprint meegestuurd met login
+		if (data.fingerprint && typeof data.fingerprint === 'string' && data.fingerprint.length < 200) {
+			deviceFingerprint = data.fingerprint;
+		}
+
+		// Check IP ban
+		if (isIpBanned(socketIp)) {
+			socket.emit("force-login", "Je bent verbannen van deze chat.");
+			socket.disconnect(true);
 			return;
 		}
 
-		loginAttempts++;
-		if (loginAttempts > LOGIN_LIMIT) {
-			loginBlocked = true;
-			console.log(`Login rate limit hit for socket: ${socket.id}`);
-			socket.emit("force-login", "Te veel inlogpogingen. Vernieuw de pagina.");
+		// Check device ban
+		if (deviceFingerprint && isDeviceBanned(deviceFingerprint)) {
+			socket.emit("force-login", "Je bent verbannen van deze chat.");
+			socket.disconnect(true);
 			return;
 		}
 
 		data.nick = data.nick.trim();
-
-		// Nick validatie: alleen letters, cijfers, underscores, koppeltekens, max 20 tekens
 		data.nick = data.nick.replace(/[^a-zA-Z0-9_\-]/g, '').substring(0, 20);
 
-		if(data.nick == ""){
+		if (data.nick == "") {
 			socket.emit("force-login", "Nick can't be empty.");
-			nick = null;
 			return;
 		}
 
-		if(containsBlockedNickname(data.nick)){
-			socket.emit(
-				"force-login",
-				"Deze gebruikersnaam bevat een geblokkeerd woord."
-			);
-			nick = null;
+		// Check nick ban
+		if (isNickBanned(data.nick)) {
+			socket.emit("force-login", "Je bent verbannen van deze chat.");
+			socket.disconnect(true);
 			return;
 		}
 
-		if(users.indexOf(data.nick) != -1){
+		if (containsBlockedNickname(data.nick)) {
+			socket.emit("force-login", "Deze gebruikersnaam bevat een geblokkeerd woord.");
+			return;
+		}
+
+		// 1 account per IP: check of dit IP al actief is
+		const existingIpSession = getActiveIp(socketIp);
+		if (existingIpSession) {
+			socket.emit("force-login", "Er is al iemand ingelogd vanaf jouw netwerk.");
+			socket.disconnect(true);
+			return;
+		}
+
+		// 1 account per device fingerprint
+		if (deviceFingerprint) {
+			const existingDeviceSession = getActiveDevice(deviceFingerprint);
+			if (existingDeviceSession) {
+				socket.emit("force-login", "Er is al iemand ingelogd vanaf dit apparaat.");
+				socket.disconnect(true);
+				return;
+			}
+		}
+
+		if (users.indexOf(data.nick) != -1) {
 			socket.emit("force-login", "This nick is already in chat.");
-			nick = null;
 			return;
 		}
 
 		nick = data.nick;
 		users.push(data.nick);
 
+		// Sla sessie op
+		activeSessions[socket.id] = { nick, ip: socketIp, fingerprint: deviceFingerprint };
+
 		console.log("User %s joined.", nick.replace(/(<([^>]+)>)/ig, ""));
 		socket.join("main");
 
-		io.to("main").emit("ue", {
-			"nick": nick
-		});
-
-		socket.emit("start", {
-			"users": users
-		});
-
-		console.log(`going to send cache to ${nick}`)
-
-		socket.emit("previous-msg", {
-			"msgs": messageCache
-		});
+		io.to("main").emit("ue", { "nick": nick });
+		socket.emit("start", { "users": users });
+		socket.emit("previous-msg", { "msgs": messageCache });
 	});
 
+	// ====================
+	// ADMIN COMMANDO'S
+	// Stuur via: /admin <wachtwoord> ban <nick>
+	//            /admin <wachtwoord> unban <nick>
+	// Wachtwoord staat ALLEEN in de .env op de server
+	// ====================
 	socket.on("send-msg", function(data){
 
-		if(nick == null){
+		if (nick == null) {
 			socket.emit("force-login", "You need to be logged in to send message.");
 			return;
 		}
 
 		let messageObject = data.m;
 
+		// Check op admin commando
+		if (messageObject && typeof messageObject.text === 'string') {
+			const text = messageObject.text.trim();
+
+			if (text.startsWith('/admin ')) {
+				const parts = text.split(' ');
+				// /admin <wachtwoord> <commando> <nick>
+				const password = parts[1];
+				const command = parts[2];
+				const targetNick = parts[3];
+
+				if (password !== ADMIN_PASSWORD) {
+					socket.emit("warn", "Ongeldig wachtwoord.");
+					return;
+				}
+
+				if (command === 'ban' && targetNick) {
+					const targetSession = Object.values(activeSessions).find(s => s.nick && s.nick.toLowerCase() === targetNick.toLowerCase());
+					banUser(
+						targetNick,
+						targetSession ? targetSession.ip : null,
+						targetSession ? targetSession.fingerprint : null
+					);
+					// Kick de gebande gebruiker
+					const targetSocketId = Object.keys(activeSessions).find(id => activeSessions[id].nick && activeSessions[id].nick.toLowerCase() === targetNick.toLowerCase());
+					if (targetSocketId) {
+						const targetSocket = io.sockets.sockets.get(targetSocketId);
+						if (targetSocket) {
+							targetSocket.emit("force-login", "Je bent verbannen door een beheerder.");
+							targetSocket.disconnect(true);
+						}
+					}
+					socket.emit("warn", `✅ ${targetNick} is verbannen.`);
+					console.log(`Admin ban: ${targetNick} door ${nick}`);
+
+				} else if (command === 'unban' && targetNick) {
+					unbanUser(targetNick);
+					socket.emit("warn", `✅ ${targetNick} is gedebanned.`);
+					console.log(`Admin unban: ${targetNick} door ${nick}`);
+
+				} else {
+					socket.emit("warn", "Gebruik: /admin <wachtwoord> ban <nick> OF unban <nick>");
+				}
+
+				return; // Stuur admin commando NIET naar de chat
+			}
+		}
+
+		// Normaal bericht — check op scheldwoorden
 		if (
 			messageObject &&
 			typeof messageObject === "object" &&
 			typeof messageObject.text === "string"
 		) {
+			const originalText = messageObject.text;
+			const hasBadWord = containsBadWord(originalText);
+
 			messageObject = {
 				...messageObject,
-				text: filterMessage(messageObject.text)
+				text: filterMessage(originalText)
 			};
+
+			// Als er een scheldwoord in zat, strike geven
+			if (hasBadWord) {
+				const session = activeSessions[socket.id];
+				const banned = addSwearStrike(nick, session ? session.ip : null, session ? session.fingerprint : null);
+				if (banned) return; // Gebruiker is nu verbannen, bericht niet sturen
+			}
 		}
 
 		const msg = {
@@ -246,39 +458,25 @@ io.sockets.on("connection", function(socket){
 		}
 
 		messageCache.push(msg);
-
-		if(messageCache.length > cache_size){
-			messageCache.shift();
-		}
+		if (messageCache.length > cache_size) messageCache.shift();
 
 		io.to("main").emit("new-msg", msg);
-
 		console.log("User %s sent message.", nick.replace(/(<([^>]+)>)/ig, ""));
 	});
 
 	socket.on("typing", function(typing){
-
-		if(nick != null){
-			socket.broadcast.to("main").emit("typing", {
-				status: typing,
-				nick: nick
-			});
-
-			console.log("%s %s typing.", nick.replace(/(<([^>]+)>)/ig, ""), typing ? "is" : "is not");
+		if (nick != null) {
+			socket.broadcast.to("main").emit("typing", { status: typing, nick: nick });
 		}
 	});
 
 	socket.on("disconnect", function(){
 		console.log("Got disconnect!");
-
-		if(nick != null){
-
+		if (nick != null) {
 			users.splice(users.indexOf(nick), 1);
-
-			io.to("main").emit("ul", {
-				"nick": nick
-			});
-
+			delete activeSessions[socket.id];
+			delete swearStrikes[nick];
+			io.to("main").emit("ul", { "nick": nick });
 			console.log("User %s left.", nick.replace(/(<([^>]+)>)/ig, ""));
 			socket.leave("main");
 			nick = null;
