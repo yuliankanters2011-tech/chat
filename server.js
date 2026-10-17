@@ -113,14 +113,69 @@ http.listen(port, function(){
 const users = [];
 let msg_id = 1;
 
+// ====================
+// RATE LIMITING
+// ====================
+
+const ipConnects = {};
+const IP_LIMIT = 5;
+const IP_WINDOW = 30000;
+
+io.use((socket, next) => {
+	const ip = socket.handshake.address;
+	const now = Date.now();
+
+	if (!ipConnects[ip]) {
+		ipConnects[ip] = { count: 1, firstTime: now };
+		return next();
+	}
+
+	const elapsed = now - ipConnects[ip].firstTime;
+	if (elapsed > IP_WINDOW) {
+		ipConnects[ip] = { count: 1, firstTime: now };
+		return next();
+	}
+
+	ipConnects[ip].count++;
+	if (ipConnects[ip].count > IP_LIMIT) {
+		console.log(`Rate limit hit for IP: ${ip}`);
+		return next(new Error('Te veel verbindingen, probeer het later opnieuw.'));
+	}
+
+	next();
+});
+
+// ====================
+
 io.sockets.on("connection", function(socket){
 	console.log("New connection!");
 
 	var nick = null;
 
+	// Login rate limiting per socket
+	let loginAttempts = 0;
+	const LOGIN_LIMIT = 5;
+	let loginBlocked = false;
+
 	socket.on("login", function(data){
 
+		if (loginBlocked) {
+			socket.emit("force-login", "Te veel inlogpogingen. Vernieuw de pagina.");
+			return;
+		}
+
+		loginAttempts++;
+		if (loginAttempts > LOGIN_LIMIT) {
+			loginBlocked = true;
+			console.log(`Login rate limit hit for socket: ${socket.id}`);
+			socket.emit("force-login", "Te veel inlogpogingen. Vernieuw de pagina.");
+			return;
+		}
+
 		data.nick = data.nick.trim();
+
+		// Nick validatie: alleen letters, cijfers, underscores, koppeltekens, max 20 tekens
+		data.nick = data.nick.replace(/[^a-zA-Z0-9_\-]/g, '').substring(0, 20);
 
 		if(data.nick == ""){
 			socket.emit("force-login", "Nick can't be empty.");
