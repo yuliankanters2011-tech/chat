@@ -33,11 +33,40 @@ const fingerprintScript = `
   window.__deviceFingerprint = generateFingerprint();
 
   // Patch de socket.emit zodat fingerprint automatisch meegestuurd wordt bij login
+  // + banlijst bovenaan tonen en opslaan in localStorage
   document.addEventListener('DOMContentLoaded', function() {
+
+    // --- Banlijst UI ---
+    function renderBanList(nicks) {
+      var existing = document.getElementById('__banlist__');
+      if (existing) existing.remove();
+      if (!nicks || nicks.length === 0) return;
+
+      var bar = document.createElement('div');
+      bar.id = '__banlist__';
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#1a1a2e;color:#ff6b6b;font-family:monospace;font-size:13px;padding:7px 14px;border-bottom:2px solid #ff6b6b;display:flex;align-items:center;gap:10px;flex-wrap:wrap;';
+      bar.innerHTML = '<span style="font-weight:bold;color:#ff4444;">🚫 Verbannen:</span> '
+        + nicks.map(function(n) {
+            return '<span style="background:#2d0000;padding:2px 8px;border-radius:4px;margin:2px;">' + n + '</span>';
+          }).join('');
+      document.body.prepend(bar);
+
+      // Ruimte maken voor de bar
+      document.body.style.paddingTop = (bar.offsetHeight + 4) + 'px';
+    }
+
+    // Laad uit localStorage bij refresh
+    try {
+      var saved = localStorage.getItem('__bannedNicks__');
+      if (saved) renderBanList(JSON.parse(saved));
+    } catch(e) {}
+
     var origEmit = null;
     var checkSocket = setInterval(function() {
       if (window.socket) {
         clearInterval(checkSocket);
+
+        // Fingerprint patch
         origEmit = window.socket.emit.bind(window.socket);
         window.socket.emit = function(event, data) {
           if (event === 'login' && data) {
@@ -45,6 +74,22 @@ const fingerprintScript = `
           }
           return origEmit(event, data);
         };
+
+        // Ontvang banlijst bij inloggen
+        window.socket.on('start', function(data) {
+          if (data.bannedNicks) {
+            try { localStorage.setItem('__bannedNicks__', JSON.stringify(data.bannedNicks)); } catch(e) {}
+            renderBanList(data.bannedNicks);
+          }
+        });
+
+        // Ontvang live updates van banlijst
+        window.socket.on('ban-list', function(data) {
+          if (data.bannedNicks) {
+            try { localStorage.setItem('__bannedNicks__', JSON.stringify(data.bannedNicks)); } catch(e) {}
+            renderBanList(data.bannedNicks);
+          }
+        });
       }
     }, 100);
   });
@@ -238,6 +283,7 @@ function addSwearStrike(nick, fingerprint) {
 
 	if (swearStrikes[nick] >= 3) {
 		banUser(nick, fingerprint);
+		io.to("main").emit("ban-list", { "bannedNicks": bans.nicks });
 		// Kick de gebruiker
 		const socketId = Object.keys(activeSessions).find(id => activeSessions[id].nick === nick);
 		if (socketId) {
@@ -337,7 +383,7 @@ io.sockets.on("connection", function(socket){
 		socket.join("main");
 
 		io.to("main").emit("ue", { "nick": nick });
-		socket.emit("start", { "users": users });
+		socket.emit("start", { "users": users, "bannedNicks": bans.nicks });
 		socket.emit("previous-msg", { "msgs": messageCache });
 	});
 
@@ -388,11 +434,13 @@ io.sockets.on("connection", function(socket){
 						}
 					}
 					socket.emit("warn", `✅ ${targetNick} is verbannen.`);
+					io.to("main").emit("ban-list", { "bannedNicks": bans.nicks });
 					console.log(`Admin ban: ${targetNick} door ${nick}`);
 
 				} else if (command === 'unban' && targetNick) {
 					unbanUser(targetNick);
 					socket.emit("warn", `✅ ${targetNick} is gedebanned.`);
+					io.to("main").emit("ban-list", { "bannedNicks": bans.nicks });
 					console.log(`Admin unban: ${targetNick} door ${nick}`);
 
 				} else {
